@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 """NeuralTrain adapter for ZUNA.
 
 The ZUNA EEG encoder and tokenization helpers live in ``AY2latent/lingua``.
@@ -48,9 +42,6 @@ def _zuna_model_defaults() -> dict[str, tp.Any]:
         "num_fine_time_pts": 32,
         "rope_dim": 4,
         "rope_theta": 10000.0,
-        "ape_dim": 0,
-        "ape_theta": 10000.0,
-        "ape_embedding_type": "scaled_dim_sinusoidal",
         "tok_idx_type": "{x,y,z,tc}",
         "dont_noise_chan_xyz": False,
         "zero_spatial": False,
@@ -70,10 +61,8 @@ class ZunaEncoderWrapper(nn.Module):
         data_norm: float = 10.0,
         data_clip: float | None = 1.0,
         do_avg_ref: bool = True,
-        z_score_type: tp.Literal["across_channel", "across_sample", "none"] = (
-            "across_channel"
-        ),
         num_bins_discretize_xyz_chan_pos: int = 100,
+        encoder_latent_downsample_factor: int = 1,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -81,11 +70,10 @@ class ZunaEncoderWrapper(nn.Module):
         self.data_norm = data_norm
         self.data_clip = data_clip
         self.do_avg_ref = do_avg_ref
-        self.z_score_type = z_score_type
         self.num_bins = num_bins_discretize_xyz_chan_pos
+        self.encoder_latent_downsample_factor = encoder_latent_downsample_factor
         self.register_buffer(
             "xyz_extremes",
-            
             torch.tensor(
                 [[-0.12, -0.12, -0.12], [0.12, 0.12, 0.12]], dtype=torch.float32
             ),
@@ -97,17 +85,9 @@ class ZunaEncoderWrapper(nn.Module):
             x = x - x.mean(dim=1, keepdim=True)
 
         eps = 1e-6
-        if self.z_score_type == "across_channel":
-            x = (x - x.mean(dim=-1, keepdim=True)) / (
-                x.std(dim=-1, keepdim=True, unbiased=False) + eps
-            )
-        elif self.z_score_type == "across_sample":
-            dims = tuple(range(1, x.ndim))
-            x = (x - x.mean(dim=dims, keepdim=True)) / (
-                x.std(dim=dims, keepdim=True, unbiased=False) + eps
-            )
-        elif self.z_score_type != "none":
-            raise ValueError(f"Invalid ZUNA z_score_type={self.z_score_type!r}")
+        x = (x - x.mean(dim=-1, keepdim=True)) / (
+            x.std(dim=-1, keepdim=True, unbiased=False) + eps
+        )
 
         x = x / self.data_norm
         if self.data_clip is not None:
@@ -155,6 +135,30 @@ class ZunaEncoderWrapper(nn.Module):
         )
         return encoder_input.to(eeg.device), seq_lens, tok_idx
 
+    # SEQUENCE PACKING
+    # NeuralBench forward input: (B, C, T)
+    # Need to re-pack to expected ZUNA encoder input: (1, B*C*coarse_time, fine_time)
+    def _tokenize_packed(
+        self,
+        x: torch.Tensor,
+        channel_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        encoder_inputs: list[torch.Tensor] = [] # reshaped data: length B, each tensor (C * coarse_time, fine_time)
+        seq_lens: list[torch.Tensor] = [] #sample boundaries: length B, each tensor (1,) w/ uniform values = C*coarse_time
+        tok_indices: list[torch.Tensor] = [] #positional indices for RoPE: each tensor (1, B * C * coarse_time, 4)
+
+        for eeg, pos in zip(x, channel_positions, strict=True):
+            encoder_input, seq_len, tok_idx = self._tokenize_one(eeg, pos)
+            encoder_inputs.append(encoder_input)
+            seq_lens.append(seq_len)
+            tok_indices.append(tok_idx)
+
+        return (
+            torch.cat(encoder_inputs, dim=0),
+            torch.cat(seq_lens, dim=0),
+            torch.cat(tok_indices, dim=1),
+        )
+
     def _encoder_forward(
         self,
         encoder_input: torch.Tensor,
@@ -185,7 +189,7 @@ class ZunaEncoderWrapper(nn.Module):
         Returns
         -------
         Tensor
-            Encoder latent registers with shape ``(B, C * ceil(T / tf), D)``.
+            Encoder latent registers with shape ``(B, C * (T // tf), D)``.
         """
         if x.ndim != 3:
             raise ValueError(f"ZUNA expects x with shape (B, C, T), got {tuple(x.shape)}")
@@ -199,6 +203,18 @@ class ZunaEncoderWrapper(nn.Module):
             raise ValueError(
                 f"ZUNA uses 3-D channel positions, got {channel_positions.shape[-1]}"
             )
+        if self.encoder_latent_downsample_factor != 1:
+            raise ValueError(
+                "Packed ZUNA inference currently requires "
+                "encoder_latent_downsample_factor=1; got "
+                f"{self.encoder_latent_downsample_factor}."
+            )
+        if x.shape[-1] % self.num_fine_time_pts != 0:
+            raise ValueError(
+                "ZUNA requires the time dimension to be divisible by "
+                f"num_fine_time_pts={self.num_fine_time_pts}; got T={x.shape[-1]}."
+            )
+
         output_device = x.device
         if not x.is_cuda:
             if not torch.cuda.is_available():
@@ -212,21 +228,13 @@ class ZunaEncoderWrapper(nn.Module):
             if param is not None and param.device != x.device:
                 self.to(x.device)
 
-        if x.shape[-1] < self.num_fine_time_pts:
-            x = torch.nn.functional.pad(x, (0, self.num_fine_time_pts - x.shape[-1]))
-        elif x.shape[-1] % self.num_fine_time_pts != 0:
-            pad = self.num_fine_time_pts - (x.shape[-1] % self.num_fine_time_pts)
-            x = torch.nn.functional.pad(x, (0, pad))
-
         x = self._preprocess_eeg(x)
-
-        outputs: list[torch.Tensor] = []
-        for eeg, pos in zip(x, channel_positions, strict=True):
-            encoder_input, seq_lens, tok_idx = self._tokenize_one(eeg, pos)
-            latent, _tok_idx_reg, _losses = self._encoder_forward(
-                encoder_input, seq_lens, tok_idx
-            )
-            outputs.append(latent.squeeze(0))
+        encoder_input, seq_lens, tok_idx = self._tokenize_packed(x, channel_positions)
+        latent, _tok_idx_reg, _losses = self._encoder_forward(
+            encoder_input, seq_lens, tok_idx
+        )
+        split_sizes = seq_lens.detach().cpu().tolist()
+        outputs = latent.squeeze(0).split(split_sizes, dim=0)
         return torch.stack(outputs, dim=0).to(output_device)
 
 
@@ -241,9 +249,6 @@ class NtZuna(BaseModelConfig):
     data_norm: float = 10.0
     data_clip: float | None = 1.0
     do_avg_ref: bool = True
-    z_score_type: tp.Literal["across_channel", "across_sample", "none"] = (
-        "across_channel"
-    )
     num_bins_discretize_xyz_chan_pos: int = 100
 
     def build(
@@ -277,6 +282,8 @@ class NtZuna(BaseModelConfig):
             data_norm=self.data_norm,
             data_clip=self.data_clip,
             do_avg_ref=self.do_avg_ref,
-            z_score_type=self.z_score_type,
             num_bins_discretize_xyz_chan_pos=self.num_bins_discretize_xyz_chan_pos,
+            encoder_latent_downsample_factor=int(
+                self.model_kwargs.get("encoder_latent_downsample_factor", 1)
+            ),
         )

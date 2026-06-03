@@ -30,7 +30,6 @@ brain_model_config:
   data_norm: 10.0
   data_clip: 1.0
   do_avg_ref: true
-  z_score_type: across_channel
   num_bins_discretize_xyz_chan_pos: 100
 downstream_model_wrapper:
   model_output_key: null
