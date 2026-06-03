@@ -1,0 +1,41 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+brain_model_name: NtZuna
+data:
+  neuro:
+    frequency: 256.0
+    filter: null
+    notch_filter: 50.0
+    baseline: null
+    # ZUNA's exact eval normalization is average reference, per-channel
+    # time-axis z-score, divide by 10, then clamp to +/-1.  The generic
+    # extractor/on-the-fly scaler cannot average-reference in that order, so
+    # NtZuna applies this normalization before tokenizing.
+    scaler: null
+    scale_factor: null
+    clamp: null
+  channel_positions:
+    n_spatial_dims: 3
+    normalize: false
+    include_ref_eeg: false
+brain_model_config:
+  =replace=: true
+  name: NtZuna
+  checkpoint_path: /data/groups/bci/checkpoints/bci/ZUNA2_5e-4/checkpoints/0000052500
+  num_fine_time_pts: 32
+  data_norm: 10.0
+  data_clip: 1.0
+  do_avg_ref: true
+  z_score_type: across_channel
+  num_bins_discretize_xyz_chan_pos: 100
+downstream_model_wrapper:
+  model_output_key: null
+  aggregation: mean
+  layers_to_unfreeze: [""]
+  probe_config: linear
+
+# ZUNA config mirrors AY2latent/lingua/apps/AY2latent_bci/configs/config_bci_eval.yaml.

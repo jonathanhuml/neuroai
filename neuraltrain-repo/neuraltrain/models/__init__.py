@@ -23,5 +23,6 @@ from . import simpleconv as _simpleconv  # noqa: F401
 from . import simplerconv as _simplerconv  # noqa: F401
 from . import sit as _sit  # noqa: F401
 from . import transformer as _transformer  # noqa: F401
+from . import zuna as _zuna  # noqa: F401
 from .base import BaseModelConfig as BaseModelConfig  # used for configs
 from .simpleconv import SimpleConvTimeAgg as SimpleConvTimeAgg
