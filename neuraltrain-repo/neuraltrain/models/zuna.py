@@ -244,7 +244,7 @@ class ZUNAEncoder(nn.Module):
 
 
 class NtZuna(BaseModelConfig):
-    """Config for the ZUNA pretrained EEG encoder."""
+    """Config for the ZUNA pretrained EEG encoder. Hyperparameters are Pydantic fields."""
 
     model_kwargs: dict[str, tp.Any] = Field(default_factory=_zuna_model_defaults)
     checkpoint_path: str | None = (
@@ -262,7 +262,6 @@ class NtZuna(BaseModelConfig):
         n_outputs: int | None = None,
         **kwargs: tp.Any,
     ) -> nn.Module:
-        del n_in_channels, n_outputs, kwargs
 
         from apps.AY2latent_bci.transformer import DecoderTransformerArgs, EncoderDecoder
         from lingua.args import dataclass_from_dict
