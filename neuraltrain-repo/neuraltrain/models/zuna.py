@@ -269,6 +269,7 @@ class NtZuna(BaseModelConfig):
 
         model_kwargs = dict(self.model_kwargs)
         model_kwargs["encoder_latent_downsample_factor"] = 1
+        model_kwargs["ape_dim"] = 0
         model_args = dataclass_from_dict(DecoderTransformerArgs, model_kwargs)
         model = EncoderDecoder(model_args)
         model.init_weights()
