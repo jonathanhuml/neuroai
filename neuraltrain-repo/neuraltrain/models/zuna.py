@@ -30,7 +30,6 @@ def _zuna_model_defaults() -> dict[str, tp.Any]:
         "input_dim": 32,
         "encoder_input_dim": 32,
         "encoder_output_dim": 32,
-        "encoder_latent_downsample_factor": 1,
         "encoder_sliding_window": 65536,
         "sliding_window": 65536,
         "xattn_sliding_window": 65536,
@@ -50,7 +49,7 @@ def _zuna_model_defaults() -> dict[str, tp.Any]:
     }
 
 
-class ZunaEncoderWrapper(nn.Module):
+class ZUNAEncoder(nn.Module):
     """Expose ZUNA encoder latents with a NeuralBench-compatible signature."""
 
     def __init__(
@@ -62,7 +61,6 @@ class ZunaEncoderWrapper(nn.Module):
         data_clip: float | None = 1.0,
         do_avg_ref: bool = True,
         num_bins_discretize_xyz_chan_pos: int = 100,
-        encoder_latent_downsample_factor: int = 1,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -71,7 +69,6 @@ class ZunaEncoderWrapper(nn.Module):
         self.data_clip = data_clip
         self.do_avg_ref = do_avg_ref
         self.num_bins = num_bins_discretize_xyz_chan_pos
-        self.encoder_latent_downsample_factor = encoder_latent_downsample_factor
         self.register_buffer(
             "xyz_extremes",
             torch.tensor(
@@ -79,6 +76,10 @@ class ZunaEncoderWrapper(nn.Module):
             ),
         )
 
+    # Average reference, normalization, and clipping
+    # TODO: Figure out ordering wrt filtering, etc, should this be kicked to YAML file?
+    # This is ZUNA-specific, so not done in the generic data YAML section
+    # Can we add our own preprocess functions there?
     def _preprocess_eeg(self, x: torch.Tensor) -> torch.Tensor:
         x = x.float()
         if self.do_avg_ref:
@@ -94,67 +95,75 @@ class ZunaEncoderWrapper(nn.Module):
             x = x.clamp(-self.data_clip, self.data_clip)
         return x
 
-    def _tokenize_one(
-        self,
-        eeg: torch.Tensor,
-        channel_positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        from apps.AY2latent_bci.eeg_data import (
-            chop_and_reshape_signals,
-            discretize_chan_pos,
-        )
-
-        chan_pos_discrete = discretize_chan_pos(
-            channel_positions.float(),
-            self.xyz_extremes.to(channel_positions.device),
-            self.num_bins,
-        )
-        (
-            encoder_input,
-            _chan_pos,
-            chan_pos_discrete,
-            _chan_id,
-            t_coarse,
-            seq_len,
-            _num_chans,
-        ) = chop_and_reshape_signals(
-            eeg_signal=eeg,
-            chan_pos=channel_positions,
-            chan_pos_discrete=chan_pos_discrete,
-            tf=self.num_fine_time_pts,
-            use_coarse_time="A",
-        )
-
-        seq_lens = torch.tensor([seq_len], dtype=torch.long, device=eeg.device)
-        tok_idx = torch.cat(
-            (
-                chan_pos_discrete.to(eeg.device).unsqueeze(0),
-                t_coarse.to(eeg.device).long().unsqueeze(0),
-            ),
-            dim=2,
-        )
-        return encoder_input.to(eeg.device), seq_lens, tok_idx
-
     # SEQUENCE PACKING
     # NeuralBench forward input: (B, C, T)
-    # Need to re-pack to expected ZUNA encoder input: (1, B*C*coarse_time, fine_time)
-    def _tokenize_packed(
+    # Re-pack to ZUNA encoder input: (1, B*C*coarse_time, fine_time).
+    def _sequence_repacking(
         self,
         x: torch.Tensor,
         channel_positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        encoder_inputs: list[torch.Tensor] = [] # reshaped data: length B, each tensor (C * coarse_time, fine_time)
-        seq_lens: list[torch.Tensor] = [] #sample boundaries: length B, each tensor (1,) w/ uniform values = C*coarse_time
-        tok_indices: list[torch.Tensor] = [] #positional indices for RoPE: each tensor (1, B * C * coarse_time, 4)
+        def _tokenize_batch_sample(
+            eeg: torch.Tensor,
+            channel_positions: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """
+            Discretize channel positions for RoPE.
+
+            chop_and_reshape_signals() converts (C, T) to
+            (C, coarse_time, fine_time). Then build tok_idx: (1, C * coarse_time, 4).
+            """
+            from apps.AY2latent_bci.eeg_data import (
+                chop_and_reshape_signals,
+                discretize_chan_pos,
+            )
+
+            chan_pos_discrete = discretize_chan_pos(
+                channel_positions.float(),
+                self.xyz_extremes.to(channel_positions.device),
+                self.num_bins,
+            )
+            (
+                encoder_input,
+                _chan_pos,
+                chan_pos_discrete,
+                _chan_id,
+                t_coarse,
+                seq_len,
+                _num_chans,
+            ) = chop_and_reshape_signals(
+                eeg_signal=eeg,
+                chan_pos=channel_positions,
+                chan_pos_discrete=chan_pos_discrete,
+                tf=self.num_fine_time_pts,
+                use_coarse_time="A",
+            )
+
+            seq_lens = torch.tensor([seq_len], dtype=torch.long, device=eeg.device)
+            tok_idx = torch.cat(
+                (
+                    chan_pos_discrete.to(eeg.device).unsqueeze(0),
+                    t_coarse.to(eeg.device).long().unsqueeze(0),
+                ),
+                dim=2,
+            )
+            return encoder_input.to(eeg.device), seq_lens, tok_idx
+
+        # Reshaped data: length B, each tensor (C * coarse_time, fine_time)
+        encoder_inputs: list[torch.Tensor] = []
+        # Sample boundaries: length B, each tensor (1,) with value C * coarse_time
+        seq_lens: list[torch.Tensor] = []
+        # Positional indices for RoPE: length B, each tensor (1, C * coarse_time, 4)
+        tok_indices: list[torch.Tensor] = []
 
         for eeg, pos in zip(x, channel_positions, strict=True):
-            encoder_input, seq_len, tok_idx = self._tokenize_one(eeg, pos)
+            encoder_input, seq_len, tok_idx = _tokenize_batch_sample(eeg, pos)
             encoder_inputs.append(encoder_input)
             seq_lens.append(seq_len)
             tok_indices.append(tok_idx)
 
         return (
-            torch.cat(encoder_inputs, dim=0),
+            torch.cat(encoder_inputs, dim=0), # (dim0, dim1)=(C*coarse_time,fine_time): cat=0 --> B*(dim0, dim1)
             torch.cat(seq_lens, dim=0),
             torch.cat(tok_indices, dim=1),
         )
@@ -189,7 +198,7 @@ class ZunaEncoderWrapper(nn.Module):
         Returns
         -------
         Tensor
-            Encoder latent registers with shape ``(B, C * (T // tf), D)``.
+            Encoder latent embeddings with shape ``(B, C * (T // fine_time), D)``.
         """
         if x.ndim != 3:
             raise ValueError(f"ZUNA expects x with shape (B, C, T), got {tuple(x.shape)}")
@@ -202,12 +211,6 @@ class ZunaEncoderWrapper(nn.Module):
         if channel_positions.shape[-1] != 3:
             raise ValueError(
                 f"ZUNA uses 3-D channel positions, got {channel_positions.shape[-1]}"
-            )
-        if self.encoder_latent_downsample_factor != 1:
-            raise ValueError(
-                "Packed ZUNA inference currently requires "
-                "encoder_latent_downsample_factor=1; got "
-                f"{self.encoder_latent_downsample_factor}."
             )
         if x.shape[-1] % self.num_fine_time_pts != 0:
             raise ValueError(
@@ -229,7 +232,9 @@ class ZunaEncoderWrapper(nn.Module):
                 self.to(x.device)
 
         x = self._preprocess_eeg(x)
-        encoder_input, seq_lens, tok_idx = self._tokenize_packed(x, channel_positions)
+        encoder_input, seq_lens, tok_idx = self._sequence_repacking(
+            x, channel_positions
+        )
         latent, _tok_idx_reg, _losses = self._encoder_forward(
             encoder_input, seq_lens, tok_idx
         )
@@ -263,7 +268,9 @@ class NtZuna(BaseModelConfig):
         from lingua.args import dataclass_from_dict
         from lingua.checkpoint import load_from_checkpoint
 
-        model_args = dataclass_from_dict(DecoderTransformerArgs, self.model_kwargs)
+        model_kwargs = dict(self.model_kwargs)
+        model_kwargs["encoder_latent_downsample_factor"] = 1
+        model_args = dataclass_from_dict(DecoderTransformerArgs, model_kwargs)
         model = EncoderDecoder(model_args)
         model.init_weights()
 
@@ -276,14 +283,11 @@ class NtZuna(BaseModelConfig):
             logger.info("Loading ZUNA checkpoint from %s", checkpoint_path)
             load_from_checkpoint(str(checkpoint_path), model, model_key="model")
 
-        return ZunaEncoderWrapper(
+        return ZUNAEncoder(
             model.encoder,
             num_fine_time_pts=self.num_fine_time_pts,
             data_norm=self.data_norm,
             data_clip=self.data_clip,
             do_avg_ref=self.do_avg_ref,
             num_bins_discretize_xyz_chan_pos=self.num_bins_discretize_xyz_chan_pos,
-            encoder_latent_downsample_factor=int(
-                self.model_kwargs.get("encoder_latent_downsample_factor", 1)
-            ),
         )
