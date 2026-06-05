@@ -7,9 +7,10 @@
 brain_model_name: NtZuna
 data:
   neuro:
-    frequency: 256.0
-    filter: null
+    drop_bads: True
     notch_filter: 50.0
+    filter: null
+    frequency: 256.0
     baseline: null
     # ZUNA's exact eval normalization is average reference, per-channel
     # time-axis z-score, divide by 10, then clamp to +/-1.  The generic

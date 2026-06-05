@@ -22,10 +22,11 @@ dependencies = [
   "umap-learn",
   "seaborn",
   "torchinfo",
-  # Pinning torch version to ensure support for CUDA capability sm_60
-  "torch==2.6",
-  "torchaudio==2.6",
-  "torchvision==0.21",
+  # torch 2.11 required: 2.6's inductor crashes lowering ZUNA's FlexAttention
+  # (LoweringException: 'Symbol' object has no attribute 'get_device').
+  "torch==2.11",
+  "torchaudio==2.11",
+  "torchvision==0.26",
 ]
 
 [project.urls]
