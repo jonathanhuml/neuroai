@@ -27,9 +27,11 @@ import torch._dynamo
 
 try:
     from .zuna import NtZuna, ZUNAEncoder
+    from .zuna_port_check import ZUNAPortChecker
 except ImportError:  # pragma: no cover - direct script execution fallback
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from neuraltrain.models.zuna import NtZuna, ZUNAEncoder
+    from neuraltrain.models.zuna_port_check import ZUNAPortChecker
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
@@ -239,10 +241,15 @@ def run_smoke_compare(args: argparse.Namespace) -> None:
     x = torch.randn(args.batch_size, args.channels, args.time, device=device)
     channel_positions = make_channel_positions(args.batch_size, args.channels, device)
 
-    x_preprocessed = zuna_wrapper._preprocess_eeg(x)
+    valid_channel_mask = zuna_wrapper._valid_channel_mask(channel_positions)
+    zuna_channel_positions = zuna_wrapper._to_zuna_native_frame(
+        channel_positions,
+        valid_channel_mask,
+    )
+    x_preprocessed = zuna_wrapper._preprocess_eeg(x, valid_channel_mask)
     encoder_input, seq_lens, tok_idx = zuna_wrapper._sequence_repacking(
         x_preprocessed,
-        channel_positions,
+        zuna_channel_positions,
     )
 
     raw_latent, raw_tok_idx_reg, raw_losses = raw_ay2latent.encoder(
@@ -459,6 +466,61 @@ def test_zuna_preprocess_normalizes_and_clips() -> None:
     assert out.max() <= 1.0 + 1e-6
 
 
+def test_zuna_converts_head_positions_to_native_with_linear_solve() -> None:
+    model = ZUNAEncoder(torch.nn.Identity(), num_fine_time_pts=32)
+    native = torch.tensor(
+        [[[-0.04, 0.08, 0.01], [0.04, 0.08, 0.01]]],
+        dtype=torch.float64,
+    )
+    rotation = model.native_to_head_rotation
+    translation = model.native_to_head_translation
+    head = native @ rotation.T + translation
+    valid = torch.ones(1, 2, dtype=torch.bool)
+
+    recovered = model._to_zuna_native_frame(head.float(), valid)
+
+    torch.testing.assert_close(recovered, native.float(), atol=1e-6, rtol=0)
+
+
+def test_zuna_flags_and_excludes_invalid_position_channels() -> None:
+    model = ZUNAEncoder(torch.nn.Identity(), num_fine_time_pts=4)
+    positions = torch.tensor(
+        [
+            [
+                [0.01, 0.02, 0.03],
+                [-0.1, -0.1, -0.1],
+                [0.04, 0.05, 0.06],
+            ]
+        ]
+    )
+    x = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [100.0, 100.0, 100.0, 100.0], [5.0, 6.0, 7.0, 8.0]]]
+    )
+
+    valid = model._valid_channel_mask(positions)
+    preprocessed = model._preprocess_eeg(x, valid)
+
+    assert valid.tolist() == [[True, False, True]]
+    torch.testing.assert_close(preprocessed[:, 1], torch.zeros_like(preprocessed[:, 1]))
+
+
+def test_zuna_restores_invalid_channels_as_zero_latents() -> None:
+    model = ZUNAEncoder(torch.nn.Identity(), num_fine_time_pts=4)
+    valid = torch.tensor([[True, False, True]])
+    sparse = torch.arange(4, dtype=torch.float32).reshape(1, 2, 2)
+
+    dense = model._restore_dense_outputs(
+        sparse,
+        torch.tensor([2]),
+        valid,
+        n_times=4,
+    )
+
+    assert dense.shape == (1, 3, 2)
+    torch.testing.assert_close(dense[0, 1], torch.zeros(2))
+    torch.testing.assert_close(dense[0, [0, 2]], sparse[0])
+
+
 def test_zuna_forward_validates_time_divisibility() -> None:
     model = ZUNAEncoder(torch.nn.Identity(), num_fine_time_pts=32)
     x = torch.randn(1, 4, 65)
@@ -470,6 +532,75 @@ def test_zuna_forward_validates_time_divisibility() -> None:
         assert "time dimension" in str(exc)
     else:
         raise AssertionError("Expected ValueError for indivisible time dimension")
+
+
+def test_port_checker_inverts_coarse_time_major_packing() -> None:
+    batch_size, n_channels, n_times, fine_time = 2, 3, 8, 4
+    original = torch.arange(
+        batch_size * n_channels * n_times, dtype=torch.float32
+    ).reshape(batch_size, n_channels, n_times)
+    packed_samples = [
+        sample.reshape(n_channels, n_times // fine_time, fine_time)
+        .transpose(0, 1)
+        .reshape(-1, fine_time)
+        for sample in original
+    ]
+    packed = torch.cat(packed_samples).unsqueeze(0)
+    seq_lens = torch.full(
+        (batch_size,), n_channels * (n_times // fine_time), dtype=torch.long
+    )
+
+    reconstructed = ZUNAPortChecker._unpack_reconstruction(
+        packed,
+        seq_lens=seq_lens,
+        n_channels=n_channels,
+        n_times=n_times,
+        fine_time=fine_time,
+    )
+
+    torch.testing.assert_close(reconstructed, original)
+
+
+def test_port_checker_decoder_is_not_registered() -> None:
+    encoder = torch.nn.Linear(4, 4)
+    decoder = torch.nn.Linear(4, 4)
+    checker = ZUNAPortChecker(
+        decoder,
+        output_dir=Path("unused"),
+        global_sigma=0.1,
+        dont_noise_chan_xyz=False,
+    )
+    model = ZUNAEncoder(encoder, num_fine_time_pts=4, port_checker=checker)
+
+    parameter_names = set(dict(model.named_parameters()))
+
+    assert "encoder.weight" in parameter_names
+    assert not any(name.startswith("_port_checker") for name in parameter_names)
+
+
+def test_port_checker_masks_first_five_channels() -> None:
+    checker = ZUNAPortChecker(
+        torch.nn.Identity(),
+        output_dir=Path("unused"),
+        global_sigma=0.1,
+        dont_noise_chan_xyz=False,
+        mask_channels=5,
+    )
+    x = torch.randn(2, 8, 16)
+    original = x.clone()
+
+    masked = checker.mask_input(x)
+
+    torch.testing.assert_close(masked[:, :5], torch.zeros_like(masked[:, :5]))
+    torch.testing.assert_close(masked[:, 5:], x[:, 5:])
+    torch.testing.assert_close(x, original)
+    dropout_indices = checker.dropout_indices(masked.flatten(0, 1))
+    assert dropout_indices is not None
+    assert dropout_indices.sum().item() == 2 * 5
+
+    checker._has_run = True
+    torch.testing.assert_close(checker.mask_input(x), x)
+    assert checker.dropout_indices(masked.flatten(0, 1)) is None
 
 
 if __name__ == "__main__":

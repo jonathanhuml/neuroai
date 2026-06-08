@@ -6,6 +6,8 @@
 
 brain_model_name: NtZuna
 data:
+  # Default batch_size (64) OOMs ZUNA on an 80GB H100 (needs ~87GB); 16 fits.
+  batch_size: 16
   neuro:
     drop_bads: True
     notch_filter: 50.0
@@ -32,6 +34,16 @@ brain_model_config:
   data_clip: 1.0
   do_avg_ref: true
   num_bins_discretize_xyz_chan_pos: 100
+  channel_position_montage: standard_1005
+  invalid_channel_position: -0.1
+  # Temporary frontend verification. The decoder is kept outside the benchmark
+  # module tree, runs on the real sample used for model initialization, then is freed.
+  port_check_enabled: true
+  port_check_output_dir: /data/groups/bci/jonhuml/workspace/neuroai/check_neuroai_port
+  port_check_sample_steps: 50
+  port_check_cfg: 1.0
+  port_check_min_batch_size: 1
+  port_check_mask_channels: 5
 downstream_model_wrapper:
   model_output_key: null
   aggregation: mean
