@@ -55,6 +55,13 @@ class LinearOutDict(nn.Module):
         }
 
 
+class IdentityKwarg(nn.Module):
+    """Identity module with a named argument for wrapper tests."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
 def test_downstream_wrapper_routes_selected_dict_key():
     """``model_output_key='key2'`` must surface ``key2``'s value, not ``key1``.
 
@@ -79,6 +86,25 @@ def test_downstream_wrapper_routes_selected_dict_key():
     out_key2 = wrapped_key2(**dummy_batch)
     assert out_key1.shape == (B, n_outputs)
     assert torch.allclose(out_key2, 2 * out_key1)
+
+
+def test_downstream_wrapper_time_mean_preserves_channels():
+    batch_size, n_channels, n_times, dim = 2, 3, 4, 5
+    x = torch.arange(
+        batch_size * n_channels * n_times * dim,
+        dtype=torch.float32,
+    ).reshape(batch_size, n_channels, n_times, dim)
+    dummy_batch = {"x": x}
+
+    wrapped = DownstreamWrapper(
+        aggregation="time_mean",
+        probe_config=None,
+    ).build(IdentityKwarg(), dummy_batch, n_channels * dim)
+
+    output = wrapped(**dummy_batch)
+
+    assert output.shape == (batch_size, n_channels * dim)
+    torch.testing.assert_close(output, x.mean(dim=2).flatten(start_dim=1))
 
 
 def test_downstream_wrapper_with_preprocessor():

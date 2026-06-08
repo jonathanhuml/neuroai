@@ -36,17 +36,11 @@ brain_model_config:
   num_bins_discretize_xyz_chan_pos: 100
   channel_position_montage: standard_1005
   invalid_channel_position: -0.1
-  # Temporary frontend verification. The decoder is kept outside the benchmark
-  # module tree, runs on the real sample used for model initialization, then is freed.
-  port_check_enabled: true
-  port_check_output_dir: /data/groups/bci/jonhuml/workspace/neuroai/check_neuroai_port
-  port_check_sample_steps: 50
-  port_check_cfg: 1.0
-  port_check_min_batch_size: 1
-  port_check_mask_channels: 5
+  # Runs the temporary one-batch AY2Latent reconstruction check.
+  debug_mode: true
 downstream_model_wrapper:
   model_output_key: null
-  aggregation: mean
+  aggregation: flatten
   layers_to_unfreeze: [""]
   probe_config: linear
 

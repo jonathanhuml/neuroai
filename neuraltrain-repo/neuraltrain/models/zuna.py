@@ -270,6 +270,7 @@ class ZUNAEncoder(nn.Module):
         valid_channel_mask: torch.Tensor,
         n_times: int,
     ) -> torch.Tensor:
+        """Restore packed latents as ``(batch, channel, coarse_time, dim)``."""
         coarse_time = n_times // self.num_fine_time_pts
         split_sizes = seq_lens.detach().cpu().tolist()
         sparse_outputs = latent.squeeze(0).split(split_sizes, dim=0)
@@ -278,11 +279,15 @@ class ZUNAEncoder(nn.Module):
             sparse_outputs, valid_channel_mask, strict=True
         ):
             dense = sparse.new_zeros(
-                valid.shape[0] * coarse_time,
+                valid.shape[0],
+                coarse_time,
                 sparse.shape[-1],
             )
-            dense_view = dense.reshape(coarse_time, valid.shape[0], -1)
-            dense_view[:, valid] = sparse.reshape(coarse_time, int(valid.sum()), -1)
+            dense[valid] = sparse.reshape(
+                coarse_time,
+                int(valid.sum()),
+                sparse.shape[-1],
+            ).transpose(0, 1)
             dense_outputs.append(dense)
         return torch.stack(dense_outputs)
 
@@ -318,7 +323,8 @@ class ZUNAEncoder(nn.Module):
         Returns
         -------
         Tensor
-            Encoder latent embeddings with shape ``(B, C * (T // fine_time), D)``.
+            Encoder latent embeddings with shape
+            ``(B, C, T // fine_time, D)``.
         """
         if x.ndim != 3:
             raise ValueError(f"ZUNA expects x with shape (B, C, T), got {tuple(x.shape)}")
@@ -359,19 +365,12 @@ class ZUNAEncoder(nn.Module):
             valid_channel_mask,
         )
         x = self._preprocess_eeg(x, valid_channel_mask)
-        encoder_x = (
-            self._port_checker.mask_input(x)
-            if self._port_checker is not None
-            else x
-        )
         encoder_input, seq_lens, tok_idx = self._sequence_repacking(
-            encoder_x, zuna_channel_positions
+            x, zuna_channel_positions
         )
-        do_idx = (
-            self._port_checker.dropout_indices(encoder_input)
-            if self._port_checker is not None
-            else None
-        )
+        # Match AY2Latent's normal encoder path. No debug masking is applied;
+        # this only identifies tokens that were already all-zero in the data.
+        do_idx = encoder_input.sum(dim=-1) == 0
         latent, _tok_idx_reg, _losses = self._encoder_forward(
             encoder_input, seq_lens, tok_idx, do_idx
         )
@@ -382,7 +381,6 @@ class ZUNAEncoder(nn.Module):
                 zuna_channel_positions=zuna_channel_positions,
                 valid_channel_mask=valid_channel_mask,
                 preprocessed_x=x,
-                masked_preprocessed_x=encoder_x,
                 encoder_input=encoder_input,
                 seq_lens=seq_lens,
                 tok_idx=tok_idx,
@@ -412,14 +410,7 @@ class NtZuna(BaseModelConfig):
     num_bins_discretize_xyz_chan_pos: int = 100
     channel_position_montage: str = "standard_1005"
     invalid_channel_position: float = -0.1
-    port_check_enabled: bool = False
-    port_check_output_dir: str = str(
-        Path(__file__).resolve().parents[3] / "check_neuroai_port"
-    )
-    port_check_sample_steps: int = 50
-    port_check_cfg: float = 1.0
-    port_check_min_batch_size: int = 1
-    port_check_mask_channels: int = 0
+    debug_mode: bool = False
 
     def build(
         self,
@@ -449,18 +440,13 @@ class NtZuna(BaseModelConfig):
             load_from_checkpoint(str(checkpoint_path), model, model_key="model")
 
         port_checker = None
-        if self.port_check_enabled:
+        if self.debug_mode:
             from .zuna_port_check import ZUNAPortChecker
 
             port_checker = ZUNAPortChecker(
                 model.decoder,
-                output_dir=Path(self.port_check_output_dir),
                 global_sigma=model.global_sigma,
                 dont_noise_chan_xyz=model.dont_noise_chan_xyz,
-                sample_steps=self.port_check_sample_steps,
-                cfg=self.port_check_cfg,
-                min_batch_size=self.port_check_min_batch_size,
-                mask_channels=self.port_check_mask_channels,
             )
 
         return ZUNAEncoder(

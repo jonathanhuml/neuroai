@@ -454,6 +454,13 @@ def test_make_channel_positions_shape() -> None:
     torch.testing.assert_close(pos[0], pos[1])
 
 
+def test_zuna_uses_single_debug_mode_config() -> None:
+    fields = NtZuna.model_fields
+
+    assert fields["debug_mode"].default is False
+    assert not any(name.startswith("port_check_") for name in fields)
+
+
 def test_zuna_preprocess_normalizes_and_clips() -> None:
     model = ZUNAEncoder(torch.nn.Identity(), num_fine_time_pts=32, data_norm=1.0)
     x = torch.randn(2, 4, 64) * 10.0
@@ -504,21 +511,22 @@ def test_zuna_flags_and_excludes_invalid_position_channels() -> None:
     torch.testing.assert_close(preprocessed[:, 1], torch.zeros_like(preprocessed[:, 1]))
 
 
-def test_zuna_restores_invalid_channels_as_zero_latents() -> None:
+def test_zuna_restores_channel_time_latent_grid() -> None:
     model = ZUNAEncoder(torch.nn.Identity(), num_fine_time_pts=4)
     valid = torch.tensor([[True, False, True]])
-    sparse = torch.arange(4, dtype=torch.float32).reshape(1, 2, 2)
+    sparse = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
 
     dense = model._restore_dense_outputs(
         sparse,
-        torch.tensor([2]),
+        torch.tensor([4]),
         valid,
-        n_times=4,
+        n_times=8,
     )
 
-    assert dense.shape == (1, 3, 2)
-    torch.testing.assert_close(dense[0, 1], torch.zeros(2))
-    torch.testing.assert_close(dense[0, [0, 2]], sparse[0])
+    assert dense.shape == (1, 3, 2, 2)
+    torch.testing.assert_close(dense[0, 1], torch.zeros(2, 2))
+    expected = sparse.reshape(2, 2, 2).transpose(0, 1)
+    torch.testing.assert_close(dense[0, [0, 2]], expected)
 
 
 def test_zuna_forward_validates_time_divisibility() -> None:
@@ -576,31 +584,6 @@ def test_port_checker_decoder_is_not_registered() -> None:
 
     assert "encoder.weight" in parameter_names
     assert not any(name.startswith("_port_checker") for name in parameter_names)
-
-
-def test_port_checker_masks_first_five_channels() -> None:
-    checker = ZUNAPortChecker(
-        torch.nn.Identity(),
-        output_dir=Path("unused"),
-        global_sigma=0.1,
-        dont_noise_chan_xyz=False,
-        mask_channels=5,
-    )
-    x = torch.randn(2, 8, 16)
-    original = x.clone()
-
-    masked = checker.mask_input(x)
-
-    torch.testing.assert_close(masked[:, :5], torch.zeros_like(masked[:, :5]))
-    torch.testing.assert_close(masked[:, 5:], x[:, 5:])
-    torch.testing.assert_close(x, original)
-    dropout_indices = checker.dropout_indices(masked.flatten(0, 1))
-    assert dropout_indices is not None
-    assert dropout_indices.sum().item() == 2 * 5
-
-    checker._has_run = True
-    torch.testing.assert_close(checker.mask_input(x), x)
-    assert checker.dropout_indices(masked.flatten(0, 1)) is None
 
 
 if __name__ == "__main__":

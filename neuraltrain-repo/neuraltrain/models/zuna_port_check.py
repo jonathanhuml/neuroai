@@ -14,6 +14,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[3] / "check_neuroai_port"
+
 
 class ZUNAPortChecker:
     """Decode and save the first NeuroAI batch."""
@@ -22,18 +24,15 @@ class ZUNAPortChecker:
         self,
         decoder: torch.nn.Module,
         *,
-        output_dir: Path,
+        output_dir: Path = DEFAULT_OUTPUT_DIR,
         global_sigma: float,
         dont_noise_chan_xyz: bool,
         sample_steps: int = 50,
         cfg: float = 1.0,
         min_batch_size: int = 1,
-        mask_channels: int = 0,
     ) -> None:
         if sample_steps <= 0:
             raise ValueError("sample_steps must be positive")
-        if mask_channels < 0:
-            raise ValueError("mask_channels must be non-negative")
         self.decoder: torch.nn.Module | None = decoder
         self.output_dir = output_dir
         self.global_sigma = global_sigma
@@ -41,22 +40,7 @@ class ZUNAPortChecker:
         self.sample_steps = sample_steps
         self.cfg = cfg
         self.min_batch_size = min_batch_size
-        self.mask_channels = mask_channels
         self._has_run = False
-
-    def mask_input(self, x: torch.Tensor) -> torch.Tensor:
-        """Zero the first configured EEG channels before ZUNA tokenization."""
-        if self._has_run or x.shape[0] < self.min_batch_size:
-            return x
-        masked = x.clone()
-        masked[:, : min(self.mask_channels, x.shape[1]), :] = 0
-        return masked
-
-    def dropout_indices(self, encoder_input: torch.Tensor) -> torch.Tensor | None:
-        """Match AY2Latent's zero-token detection for its learned dropout vector."""
-        if self._has_run:
-            return None
-        return encoder_input.sum(dim=-1) == 0
 
     @torch.no_grad()
     def _sample_from_latent(
@@ -156,9 +140,8 @@ class ZUNAPortChecker:
 
     @staticmethod
     def _plot_reconstructions(
-        masked_input: torch.Tensor,
+        encoder_source: torch.Tensor,
         reconstruction: torch.Tensor,
-        original: torch.Tensor,
         output_dir: Path,
     ) -> None:
         from apps import AY2latent_bci
@@ -172,23 +155,22 @@ class ZUNAPortChecker:
             plot_compare_eeg_signal,
         )
 
-        for batch_idx, (masked, recon, source) in enumerate(
-            zip(masked_input, reconstruction, original, strict=True)
+        for batch_idx, (source, recon) in enumerate(
+            zip(encoder_source, reconstruction, strict=True)
         ):
-            masked_np = masked.float().cpu().numpy()
-            recon_np = recon.float().cpu().numpy()
             source_np = source.float().cpu().numpy()
+            recon_np = recon.float().cpu().numpy()
             plot_compare_eeg_signal(
-                data=masked_np,
+                data=source_np,
                 reconst=recon_np,
                 mse_value=compute_nmse(source_np, recon_np),
                 pcc_value=compute_pcc(source_np, recon_np),
-                eeg_signal=source_np,
+                eeg_signal=None,
                 fs=256,
                 batch=batch_idx,
                 sample=0,
                 idx=0,
-                fname_tag="_neuroai_port_first_five_masked",
+                fname_tag="_neuroai_port_unmasked",
                 dir_base=str(output_dir),
             )
 
@@ -200,7 +182,6 @@ class ZUNAPortChecker:
         zuna_channel_positions: torch.Tensor,
         valid_channel_mask: torch.Tensor,
         preprocessed_x: torch.Tensor,
-        masked_preprocessed_x: torch.Tensor,
         encoder_input: torch.Tensor,
         seq_lens: torch.Tensor,
         tok_idx: torch.Tensor,
@@ -214,6 +195,11 @@ class ZUNAPortChecker:
         # Set this before decoding so a failed check does not repeatedly run in training.
         self._has_run = True
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        for stale_name in (
+            "masked_preprocessed_x.pt",
+            "eeg_signal_compare_B0_S0_neuroai_port_first_five_masked.png",
+        ):
+            (self.output_dir / stale_name).unlink(missing_ok=True)
         if self.decoder is None:
             raise RuntimeError(
                 "The one-time ZUNA port-check decoder was already released"
@@ -247,7 +233,6 @@ class ZUNAPortChecker:
             "zuna_channel_positions.pt": zuna_channel_positions,
             "valid_channel_mask.pt": valid_channel_mask,
             "preprocessed_x.pt": preprocessed_x,
-            "masked_preprocessed_x.pt": masked_preprocessed_x,
             "reconstructions.pt": reconstruction,
             "packed_reconstructions.pt": packed_reconstruction,
             "encoder_latents.pt": latent,
@@ -259,9 +244,8 @@ class ZUNAPortChecker:
             torch.save(tensor.detach().cpu(), self.output_dir / filename)
 
         self._plot_reconstructions(
-            masked_preprocessed_x.detach(),
-            reconstruction.detach(),
             preprocessed_x.detach(),
+            reconstruction.detach(),
             self.output_dir,
         )
         # The benchmark only needs the encoder after this one-time check.

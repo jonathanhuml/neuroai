@@ -71,6 +71,18 @@ class ConcatGroupedMean(nn.Module):
         )
 
 
+class TimeMeanFlatten(nn.Module):
+    """Average a channel-time grid over time, then flatten channel features."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(
+                "aggregation='time_mean' expects "
+                "(batch, channel, time, embedding) output"
+            )
+        return x.mean(dim=2).flatten(start_dim=1)
+
+
 class ChannelProjection(pydantic.BaseModel):
     """Configuration for a Conv1d(kernel_size=1) channel projection adapter.
 
@@ -375,11 +387,13 @@ class DownstreamWrapper(pydantic.BaseModel):
         If True, when freezing/unfreezing layers, only the first part of the layer name
         (before the first dot) must match exactly. If False, any part of the layer name
         can match the patterns. Default is True.
-    aggregation : {"flatten", "mean", "first"} or int, optional
+    aggregation : {"flatten", "mean", "first", "time_mean"} or int, optional
         Method to aggregate the model output.
         ``"flatten"`` flattens all dimensions except batch;
         ``"mean"`` averages over the temporal/sequence dimension (dim=1);
         ``"first"`` selects only the first timestep/token;
+        ``"time_mean"`` expects ``(B, C, T, D)``, averages only over
+        ``T``, then flattens the remaining channel and embedding dimensions;
         an ``int`` splits into n groups, averages each group, then concatenates;
         ``None`` performs no aggregation.
     probe_config : Mlp | "linear" | None, optional
@@ -397,7 +411,9 @@ class DownstreamWrapper(pydantic.BaseModel):
     layers_to_freeze: list[str] | None = None
     layers_to_unfreeze: list[str] | tp.Literal["last"] | None = None
     strict_matching: bool = True
-    aggregation: tp.Literal["flatten", "mean", "first"] | int | None = "flatten"
+    aggregation: (
+        tp.Literal["flatten", "mean", "first", "time_mean"] | int | None
+    ) = "flatten"
     probe_config: Mlp | tp.Literal["linear"] | None = "linear"
 
     @property
@@ -506,7 +522,9 @@ class DownstreamWrapperModel(nn.Module):
         layers_to_freeze: list[str] | None = None,
         layers_to_unfreeze: list[str] | tp.Literal["last"] | None = None,
         strict_matching: bool = True,
-        aggregation: tp.Literal["flatten", "mean", "first"] | int | None = "flatten",
+        aggregation: (
+            tp.Literal["flatten", "mean", "first", "time_mean"] | int | None
+        ) = "flatten",
         probe_config: Mlp | tp.Literal["linear"] | None = None,
     ):
         super().__init__()
@@ -566,7 +584,9 @@ class DownstreamWrapperModel(nn.Module):
 
     def _build_aggregation(
         self,
-        aggregation: tp.Literal["flatten", "mean", "first"] | int | None,
+        aggregation: (
+            tp.Literal["flatten", "mean", "first", "time_mean"] | int | None
+        ),
         brain_model_output_size: torch.Size,
     ) -> int:
         """Build the aggregation module and return the flattened input size for the probe."""
@@ -594,6 +614,14 @@ class DownstreamWrapperModel(nn.Module):
                 )
             self.aggregation = Mean(dim=dim)
             return brain_model_output_size[-1]
+        elif aggregation == "time_mean":
+            if len(brain_model_output_size) != 3:
+                raise ValueError(
+                    "aggregation='time_mean' requires model output shaped "
+                    "(batch, channel, time, embedding)"
+                )
+            self.aggregation = TimeMeanFlatten()
+            return brain_model_output_size[0] * brain_model_output_size[2]
         elif isinstance(aggregation, int):
             assert len(brain_model_output_size) == 2
             self.aggregation = ConcatGroupedMean(dim=1, n_splits=aggregation)
