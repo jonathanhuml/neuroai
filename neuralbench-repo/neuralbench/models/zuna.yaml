@@ -6,7 +6,7 @@
 
 brain_model_name: NtZuna
 data:
-  # Default batch_size (64) OOMs ZUNA on an 80GB H100 (needs ~87GB); 16 fits.
+  # Use more optimizer updates per epoch for full-model fine-tuning.
   batch_size: 16
   neuro:
     drop_bads: True
@@ -25,6 +25,19 @@ data:
     n_spatial_dims: 3
     normalize: false
     include_ref_eeg: false
+trainer_config:
+  log_every_n_steps: 1
+  n_epochs: 100
+  # OneCycle warms up for 10% of training, so patience must exceed 10 epochs.
+  patience: 15
+lightning_optimizer_config:
+  optimizer:
+    lr: 1.0e-5
+  scheduler:
+    kwargs:
+      max_lr: 1.0e-5
+# Persist train/validation metrics and the OneCycle learning rate locally.
+csv_config: {}
 brain_model_config:
   =replace=: true
   name: NtZuna
@@ -36,12 +49,10 @@ brain_model_config:
   num_bins_discretize_xyz_chan_pos: 100
   channel_position_montage: standard_1005
   invalid_channel_position: -0.1
-  # Runs the temporary one-batch AY2Latent reconstruction check.
-  debug_mode: true
+  debug_mode: false
 downstream_model_wrapper:
   model_output_key: null
-  aggregation: flatten
-  layers_to_unfreeze: [""]
+  aggregation: mean
   probe_config: linear
 
 # ZUNA config mirrors AY2latent/lingua/apps/AY2latent_bci/configs/config_bci_eval.yaml.
